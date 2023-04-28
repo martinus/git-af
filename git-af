@@ -6,8 +6,375 @@ git-af - Git Autofixup
 TODO
 
 """
-__version_info__ = ('0', '2', '0')
+
+__version_info__ = ('0', '0', '1')
 __version__ = '.'.join(__version_info__)
 
+import argparse
+import re
+import subprocess
+
+
+class GitAutoFixup:
+    def __init__(self, args):
+        self._args = args
+
+    def _is_index_dirty(self):
+        result = subprocess.run(
+            ["git", "diff-index", "--cached", "HEAD", "--quiet"],
+            cwd=self._toplevel, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return result.returncode
+
+    def _diff_hunks(self):
+        """
+        Returns the diff hunks for the repository. If the index is dirty, the hunks will include cached changes.
+        """
+
+        cmd = ["git", "-c", "diff.noprefix=false", "diff", "--no-ext-diff",
+               "--ignore-submodules", f"-U{self._args.unified}"]
+        if self._is_index_dirty():
+            cmd.append("--cached")
+        print(cmd)
+        exit(0)
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE) as proc:
+            hunks = parse_hunks(proc.stdout, keep_lines=True)
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, cmd)
+        return hunks
+
+    def process(self):
+        print(self._args)
+
+        # sanity checks
+        result = subprocess.run(["git", "rev-parse", "--verify", self._args.upstream + '^{commit}'],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if result.returncode != 0:
+            print(
+                f'ERROR: cannot resolve the given commit "{self._args.upstream}"')
+            exit(2)
+
+        if self._args.unified < 0:
+            print(
+                f'ERROR: context line needs to be >= 0, got {self._args.unified}')
+            exit(1)
+
+        # run everything in the toplevel
+        self._toplevel = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"], encoding='utf-8').strip()
+
+        hunks = self._diff_hunks()
+
+
 if __name__ == '__main__':
-    print(f'Hello, World!')
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('-v', '--version', action='version',
+                        version='%(prog)s ' + __version__)
+    parser.add_argument("-U", "--unified", type=int, default=3,
+                        help="Number of diff context lines (default: 3)")
+    parser.add_argument("upstream",
+                        help="Upstream commit. Hunks will be assigned to commits in range \"upstream..HEAD\"")
+    args = parser.parse_args()
+
+    gaf = GitAutoFixup(args)
+    gaf.process()
+
+
+'''
+
+def parse_hunks(file_name):
+    """
+    Parse hunks out of `git diff` output.
+    Return a list of dictionaries representing the hunks, where each dictionary
+    contains the following fields:
+
+    - file: the name of the file being modified
+    - start: the starting line number of the hunk in the file being modified
+    - count: the number of lines modified in the hunk
+    - header: the header line of the hunk
+    - lines: a list of the lines modified in the hunk
+
+    The function takes a file handle `fh` containing the output of a `git diff` command,
+    reads it line by line, and extracts the relevant information from each line.
+    The function uses regular expressions to match patterns in the input lines,
+    and builds up the output list of dictionaries as it processes the input.
+    The function returns the final list of dictionaries representing the hunks.
+    """
+
+    file_a = None
+    file_b = None
+    hunks = []
+    with open(file_name, "r") as fh:
+        for line in fh:
+            if line.startswith('--- '):
+                file_a = line[4:].strip('\t\n')
+            elif line.startswith('+++ '):
+                file_b = line[4:].strip('\t\n')
+            elif re.match(r'^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@', line):
+                header = line
+                file_a = re.sub(r'^[abiwco]/', '', file_a) if file_a else None
+                file_b = re.sub(r'^[abiwco]/', '', file_b) if file_b else None
+                if file_a != file_b:
+                    continue  # Ignore creations and deletions.
+                lines = []
+                while True:
+                    line = fh.readline()
+                    if not line or not re.match(r'^[ +\\-]', line):
+                        break
+                    lines.append(line)
+                hunks.append({
+                    'file': file_a,
+                    'start': int(re.match(r'^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@', header).group(1)),
+                    'count': int(re.match(r'^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@', header).group(2) or 1),
+                    'header': header,
+                    'lines': lines,
+                })
+                # The next line after a hunk could be a header for the next commit
+                # or hunk.
+                if not line:
+                    line = fh.readline()
+                    continue
+        return hunks
+
+
+def git_cmd(*args):
+    """
+    Returns a tuple that represents a Git command with options and arguments.
+
+    The function takes any number of arguments and returns a tuple containing the string
+    'git', followed by the contents of the GIT_OPTIONS list (if any), followed by the
+    arguments passed to the function.
+
+    Example usage:
+    ```python
+    command = git_cmd('log', '--oneline', 'master..dev')
+    subprocess.run(command)
+    ```
+    """
+    return ('git', *GIT_OPTIONS, *args)
+
+
+def summary_for_commits(rev):
+    """
+    Returns a dictionary containing the commit message summaries for a given revision.
+
+    The function takes a string `rev` that specifies the revision to summarize, and uses
+    the `git log` command to retrieve the commit history for the specified revision,
+    excluding merge commits. It then splits the output into SHA-1 hashes and commit message
+    summaries, and returns a dictionary mapping each SHA-1 hash to its summary.
+
+    Example usage:
+    ```python
+    summaries = summary_for_commits('HEAD')
+    for sha, summary in summaries.items():
+        print(f'{sha}: {summary}')
+    ```
+    """
+    commits = {}
+    for line in subprocess.check_output(['git', 'log', '--no-merges', f'--format=%H:%s', f'{rev}..']).decode().split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        sha, summary = line.split(':', maxsplit=1)
+        commits[sha] = summary.strip()
+    return commits
+
+
+def sha_aliases(summary_for):
+    """
+    Returns a dictionary of SHA-1 aliases for fixup!/squash! commits.
+
+    The function takes a dictionary `summary_for` that maps each commit's SHA-1 hash to
+    its summary message. It then searches for commits with a summary message starting
+    with "fixup!" or "squash!", and generates an alias for each commit that points to
+    the SHA-1 hash of the commit being fixed up or squashed. The function returns a
+    dictionary that maps each fixup!/squash! commit SHA-1 hash to its alias.
+
+    Example usage:
+    ```python
+    summaries = summary_for_commits('HEAD')
+    aliases = sha_aliases(summaries)
+    for sha, alias in aliases.items():
+        print(f'{sha} -> {alias}')
+    ```
+    """
+    aliases = {}
+    targets = list(summary_for.keys())
+    for sha in targets:
+        summary = summary_for[sha]
+        if not summary.startswith(('fixup!', 'squash!')):
+            continue
+        prefix = summary.split(' ', maxsplit=1)[1]
+        if prefix.startswith(('fixup!', 'squash!')):
+            raise ValueError(
+                f"fixup commits for fixup commits aren't supported: {sha}")
+        matches = [
+            target for target in targets if summary_for[target].startswith(prefix)]
+        if len(matches) > 1:
+            raise ValueError(
+                f"ambiguous fixup commit target: multiple commit summaries start with: {prefix}")
+        elif not matches:
+            raise ValueError(f"no fixup target in topic branch: {sha}")
+        else:
+            aliases[sha] = matches[0]
+    return aliases
+
+
+VERBOSE = True
+
+
+def fixup_sha(args):
+    """
+    Given a dictionary `args` containing the arguments `hunk`, `blame`,
+    `summary_for`, and `strict`, this function determines the targets of a diff
+    hunk that modifies lines that have been "blamed" to a certain commit in a
+    Git repository. It calls either `fixup_targets_from_all_context` or
+    `fixup_targets_from_adjacent_context` depending on the value of `strict`.
+    It then checks if the upstream commit (i.e., the commit that originally
+    "blamed" the modified lines) is among the targets. If it is and `strict` is
+    `True`, the function returns `None`. If there are multiple targets, the
+    function also returns `None`. If there is exactly one target, it returns
+    that target. The function raises a `ValueError` if any of the arguments
+    are `None`. The function also prints some diagnostic messages to the
+    console if the `VERBOSE` flag is `True`, but this flag is not defined in
+    the code snippet.
+    """
+    hunk = args['hunk']
+    blame = args['blame']
+    summary_for = args['summary_for']
+    strict = args['strict']
+
+    if None in (hunk, blame, summary_for, strict):
+        raise ValueError('missing argument')
+
+    targets = []
+    if args['strict'] == CONTEXT:
+        targets = fixup_targets_from_all_context(args)
+        topic_targets = [t for t in targets if summary_for.get(t) is not None]
+        if len(topic_targets) > 1:
+            # The context assignment is ambiguous, but an adjacency assignment
+            # might not be.
+            targets = fixup_targets_from_adjacent_context(args)
+    else:
+        targets = fixup_targets_from_adjacent_context(args)
+
+    upstream_is_blamed = any(summary_for.get(t) is None for t in targets)
+    topic_targets = [t for t in targets if summary_for.get(t) is not None]
+    if strict and upstream_is_blamed:
+        VERBOSE and print(
+            hunk_desc(hunk), " changes lines blamed on upstream\n")
+        return None
+    elif len(topic_targets) > 1:
+        VERBOSE and print(hunk_desc(hunk), " has multiple targets\n")
+        return None
+    elif len(topic_targets) == 0:
+        VERBOSE and print(hunk_desc(hunk), " has no targets\n")
+        return None
+    return topic_targets[0]
+
+
+def hunk_desc(hunk):
+    """
+    Given a dictionary `hunk` containing information about a diff hunk in a Git
+    repository (including the file path and the header), returns a string
+    describing the hunk in a compact format. The string consists of the file
+    path and the first @@-delimited segment of the header (which specifies the
+    start and length of the modified lines). The two parts are separated by a
+    space character.
+    """
+    return " ".join([hunk["file"], re.search("@@[^@]*@@", hunk["header"]).group()])
+
+
+def fixup_targets_from_all_context(args):
+    """
+    Given a dictionary `args` containing the arguments `hunk`, `blame`, and
+    `summary_for`, this function returns a list of Git commit hashes corresponding
+    to the commits that "blamed" the modified lines in the hunk, based on the
+    blame information in the `blame` dictionary. The `summary_for` dictionary maps
+    Git commit hashes to "topics" (strings that describe the purpose or contents
+    of the commit), and is used to filter the returned targets to only those
+    with a known topic. If any of the required arguments are `None`, the function
+    raises a `ValueError`.
+    """
+    hunk, blame, summary_for = args["hunk"], args["blame"], args["summary_for"]
+    if any(v is None for v in (hunk, blame, summary_for)):
+        raise ValueError("Missing argument")
+
+    targets = list(set(b["sha"] for b in blame.values()))
+    targets = [t for t in targets if summary_for.get(t)]
+    return targets
+
+
+def fixup_targets_from_adjacent_context(args):
+        """
+    Given a dictionary containing 'hunk', 'blame', 'summary_for', and 'strict' keys,
+    this function returns a list of target commit hashes that are candidates for fixing
+    the blame information for the lines changed in the 'hunk'.
+
+    Args:
+    - args: A dictionary containing the following keys:
+        - 'hunk': A dictionary containing the file path, header, and diff lines of a hunk
+        - 'blame': A dictionary containing blame information for the file
+        - 'summary_for': A dictionary mapping topic names to commit hashes
+        - 'strict': A flag indicating how strict to be when identifying targets
+
+    Returns:
+    - A list of commit hashes that are candidates for fixing the blame information for
+      the lines changed in the 'hunk'.
+    """
+    hunk = args['hunk']
+    blame = args['blame']
+    summary_for = args['summary_for']
+    strict = args['strict']
+    
+    if None in (hunk, blame, summary_for, strict):
+        raise ValueError('missing argument')
+    
+    blame_indexes = blame_indexes(hunk)
+    blamed = {}
+    diff = hunk['lines']
+    
+    for di in range(len(diff)):
+        bi = blame_indexes[di]
+        line = diff[di]
+        
+        if line.startswith('-'):
+            sha = blame[bi]['sha']
+            blamed[sha] = 1
+        elif line.startswith('+'):
+            lines = []
+            if di > 0 and blame.get(bi-1) is not None:
+                lines.append(bi-1)
+            
+            if blame.get(bi) is not None:
+                lines.append(bi)
+            
+            adjacent_shas = set([blame[x]['sha'] for x in lines])
+            target_shas = [x for x in adjacent_shas if summary_for.get(x)]
+            
+            is_surrounded = len(target_shas) > 0 and len(target_shas) == len(adjacent_shas) and target_shas[0] == target_shas[-1]
+            is_adjacent = len(target_shas) == 1
+            
+            if is_surrounded or (strict < SURROUNDED and is_adjacent):
+                blamed[target_shas[0]] = 1
+            
+            while di < len(diff)-1 and diff[di+1].startswith('+'):
+                di += 1
+    
+    targets = list(blamed.keys())
+    return targets if strict else targets[0] if len(targets) == 1 else None
+
+
+# Map lines in a hunk's diff to the corresponding `git blame HEAD` output.
+def blame_indexes(hunk):
+    indexes = []
+    bi = hunk['start']
+    for di in range(len(hunk['lines'])):
+        indexes.append(bi)
+        first = hunk['lines'][di][0]
+        if first == '-' or first == ' ':
+            bi += 1
+        # Don't increment bi for added lines.
+    return indexes
+
+'''
