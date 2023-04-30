@@ -132,16 +132,25 @@ class GitAutoFixup:
             print(f'{sha} -> {alias}')
         ```
         """
+        
         aliases = {}
-        targets = list(summary_for.keys())
-        for sha in targets:
-            summary = summary_for[sha]
-            if not summary.startswith(('fixup!', 'squash!')):
+        for sha, summary in summary_for.items():
+            match = re.match(r"^(?:fixup|squash)! (.*)", summary)
+            if not match:
                 continue
-            prefix = summary.split(' ', maxsplit=1)[1]
-            if prefix.startswith(('fixup!', 'squash!')):
-                raise ValueError(
-                    f"fixup commits for fixup commits aren't supported: {sha}")
+
+            prefix = match.group(1)
+            if re.match(r"^(?:fixup|squash)! ", prefix):
+                print("ERROR: fixup commits for fixup commits are not supported: {sha}")
+                exit(1)
+
+            # how to do this?
+            matches = [
+                target for target in targets if summary_for[target].startswith(prefix)]
+
+
+            print(f"sha={sha}, summary={summary}, group=[{match.group(1)}]")
+            '''
             matches = [
                 target for target in targets if summary_for[target].startswith(prefix)]
             if len(matches) > 1:
@@ -151,6 +160,7 @@ class GitAutoFixup:
                 raise ValueError(f"no fixup target in topic branch: {sha}")
             else:
                 aliases[sha] = matches[0]
+            '''
         return aliases
 
     def process(self):
@@ -175,6 +185,7 @@ class GitAutoFixup:
 
         hunks = self._diff_hunks()
         summary_for = self._summary_for_commits(self._args.upstream)
+        self._sha_aliases(summary_for)
         pprint(summary_for)
         #pprint(hunks, width=200)
 
