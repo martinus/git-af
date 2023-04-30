@@ -48,6 +48,9 @@ class GitAutoFixup:
         return filename
 
     def _parse_hunks(self, stream):
+        """
+        parses git diff format into hunks
+        """
         hunks = []
         file_a = ""
         file_b = ""
@@ -96,6 +99,59 @@ class GitAutoFixup:
         proc = subprocess.Popen(cmd, cwd=self._toplevel,
                                 encoding='utf-8', stdout=subprocess.PIPE)
         return self._parse_hunks(proc.stdout)
+    
+    def _summary_for_commits(self, rev):
+        """
+        Returns a dictionary SHA => commit message summary
+        Returns a dictionary containing the commit message summaries for a given revision up to HEAD.
+        """
+        commits = {}
+        for line in subprocess.check_output(['git', 'log', '--no-merges', f'--format=%H:%s', f'{rev}..']).decode().split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            sha, summary = line.split(':', maxsplit=1)
+            commits[sha] = summary.strip()
+        return commits
+    
+    def _sha_aliases(self, summary_for):
+        """
+        Returns a dictionary of SHA-1 aliases for fixup!/squash! commits.
+
+        The function takes a dictionary `summary_for` that maps each commit's SHA-1 hash to
+        its summary message. It then searches for commits with a summary message starting
+        with "fixup!" or "squash!", and generates an alias for each commit that points to
+        the SHA-1 hash of the commit being fixed up or squashed. The function returns a
+        dictionary that maps each fixup!/squash! commit SHA-1 hash to its alias.
+
+        Example usage:
+        ```python
+        summaries = summary_for_commits('HEAD')
+        aliases = sha_aliases(summaries)
+        for sha, alias in aliases.items():
+            print(f'{sha} -> {alias}')
+        ```
+        """
+        aliases = {}
+        targets = list(summary_for.keys())
+        for sha in targets:
+            summary = summary_for[sha]
+            if not summary.startswith(('fixup!', 'squash!')):
+                continue
+            prefix = summary.split(' ', maxsplit=1)[1]
+            if prefix.startswith(('fixup!', 'squash!')):
+                raise ValueError(
+                    f"fixup commits for fixup commits aren't supported: {sha}")
+            matches = [
+                target for target in targets if summary_for[target].startswith(prefix)]
+            if len(matches) > 1:
+                raise ValueError(
+                    f"ambiguous fixup commit target: multiple commit summaries start with: {prefix}")
+            elif not matches:
+                raise ValueError(f"no fixup target in topic branch: {sha}")
+            else:
+                aliases[sha] = matches[0]
+        return aliases
 
     def process(self):
         print(self._args)
@@ -113,12 +169,14 @@ class GitAutoFixup:
                 f'ERROR: context line needs to be >= 0, got {self._args.unified}')
             exit(1)
 
-        # run everything in the toplevel
+        # find out git's root directory
         self._toplevel = subprocess.check_output(
             ["git", "rev-parse", "--show-toplevel"], encoding='utf-8').strip()
 
         hunks = self._diff_hunks()
-        pprint(hunks, width=200)
+        summary_for = self._summary_for_commits(self._args.upstream)
+        pprint(summary_for)
+        #pprint(hunks, width=200)
 
 
 if __name__ == '__main__':
