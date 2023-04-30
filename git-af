@@ -13,6 +13,18 @@ __version__ = '.'.join(__version_info__)
 import argparse
 import re
 import subprocess
+from dataclasses import dataclass
+from typing import List
+from pprint import pprint
+
+
+@dataclass
+class Hunk:
+    file: str
+    start_line: int
+    num_lines: int
+    header: str
+    lines: List[str]
 
 
 class GitAutoFixup:
@@ -20,10 +32,56 @@ class GitAutoFixup:
         self._args = args
 
     def _is_index_dirty(self):
+        """
+        checks whether the Git index (staging area) has any changes that are not yet committed.
+        True when anything is staged, false otherwise.
+        """
         result = subprocess.run(
             ["git", "diff-index", "--cached", "HEAD", "--quiet"],
             cwd=self._toplevel, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return result.returncode
+
+    def _parse_diff_filename(self, line) -> str:
+        filename = line[4:].strip('\t\n')
+        if filename:
+            filename = re.sub(r'^[abiwco]/', '', filename)
+        return filename
+
+    def _parse_hunks(self, stream):
+        hunks = []
+        file_a = ""
+        file_b = ""
+        line = None
+        has_next_line = False
+
+        while True:
+            if not has_next_line:
+                line = stream.readline().rstrip('\t\n')
+            has_next_line = False
+            if not line:
+                break
+
+            if line.startswith('--- '):
+                file_a = self._parse_diff_filename(line)
+            elif line.startswith('+++ '):
+                file_b = self._parse_diff_filename(line)
+            elif file_a == file_b:
+                # Ignore creations and deletions when they are not equal
+                match = re.match(
+                    r'^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@', line)
+                if match:
+                    header = line
+                    lines = []
+                    has_next_line = True
+                    while True:
+                        line = stream.readline().rstrip('\t\n')
+                        if not line or not re.match(r'^[ +\\-]', line):
+                            break
+                        lines.append(line)
+                    hunk = Hunk(file_a, int(match.group(1)),
+                                int(match.group(2)), header, lines)
+                    hunks.append(hunk)
+        return hunks
 
     def _diff_hunks(self):
         """
@@ -34,13 +92,10 @@ class GitAutoFixup:
                "--ignore-submodules", f"-U{self._args.unified}"]
         if self._is_index_dirty():
             cmd.append("--cached")
-        print(cmd)
-        exit(0)
-        with subprocess.Popen(cmd, stdout=subprocess.PIPE) as proc:
-            hunks = parse_hunks(proc.stdout, keep_lines=True)
-            if proc.returncode != 0:
-                raise subprocess.CalledProcessError(proc.returncode, cmd)
-        return hunks
+
+        proc = subprocess.Popen(cmd, cwd=self._toplevel,
+                                encoding='utf-8', stdout=subprocess.PIPE)
+        return self._parse_hunks(proc.stdout)
 
     def process(self):
         print(self._args)
@@ -63,6 +118,7 @@ class GitAutoFixup:
             ["git", "rev-parse", "--show-toplevel"], encoding='utf-8').strip()
 
         hunks = self._diff_hunks()
+        pprint(hunks, width=200)
 
 
 if __name__ == '__main__':
