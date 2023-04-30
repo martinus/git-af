@@ -27,6 +27,12 @@ class Hunk:
     lines: List[str]
 
 
+@dataclass
+class ShaSummary:
+    sha: str
+    summary: str
+
+
 class GitAutoFixup:
     def __init__(self, args):
         self._args = args
@@ -99,21 +105,27 @@ class GitAutoFixup:
         proc = subprocess.Popen(cmd, cwd=self._toplevel,
                                 encoding='utf-8', stdout=subprocess.PIPE)
         return self._parse_hunks(proc.stdout)
-    
+
     def _summary_for_commits(self, rev):
         """
-        Returns a dictionary SHA => commit message summary
-        Returns a dictionary containing the commit message summaries for a given revision up to HEAD.
+        Returns an array [(sha, commit message summary), (sha, msg), ...] of all the commits
         """
-        commits = {}
+        commits = []
         for line in subprocess.check_output(['git', 'log', '--no-merges', f'--format=%H:%s', f'{rev}..']).decode().split('\n'):
             line = line.strip()
             if not line:
                 continue
             sha, summary = line.split(':', maxsplit=1)
-            commits[sha] = summary.strip()
+            commits.append(ShaSummary(sha, summary))
         return commits
-    
+
+    def _collect_sha_with_prefix(self, summary_for: List[ShaSummary], prefix: str) -> List[str]:
+        sha_list = []
+        for sha_summary in summary_for:
+            if sha_summary.summary.startswith(prefix):
+                sha_list.append(sha_summary.sha)
+        return sha_list
+
     def _sha_aliases(self, summary_for):
         """
         Returns a dictionary of SHA-1 aliases for fixup!/squash! commits.
@@ -132,35 +144,32 @@ class GitAutoFixup:
             print(f'{sha} -> {alias}')
         ```
         """
-        
+
         aliases = {}
-        for sha, summary in summary_for.items():
-            match = re.match(r"^(?:fixup|squash)! (.*)", summary)
+        for sha_summary in summary_for:
+            match = re.match(r"^(?:fixup|squash)! (.*)", sha_summary.summary)
             if not match:
                 continue
 
             prefix = match.group(1)
             if re.match(r"^(?:fixup|squash)! ", prefix):
-                print("ERROR: fixup commits for fixup commits are not supported: {sha}")
+                print(
+                    "ERROR: fixup commits for fixup commits are not supported: {sha}")
                 exit(1)
 
-            # how to do this?
-            matches = [
-                target for target in targets if summary_for[target].startswith(prefix)]
-
-
-            print(f"sha={sha}, summary={summary}, group=[{match.group(1)}]")
-            '''
-            matches = [
-                target for target in targets if summary_for[target].startswith(prefix)]
+            # find commit target for fixup
+            matches = self._collect_sha_with_prefix(summary_for, prefix)
             if len(matches) > 1:
-                raise ValueError(
-                    f"ambiguous fixup commit target: multiple commit summaries start with: {prefix}")
-            elif not matches:
-                raise ValueError(f"no fixup target in topic branch: {sha}")
-            else:
-                aliases[sha] = matches[0]
-            '''
+                print(
+                    "ERROR: ambigous fixup commit target: multiple commit summaries start with '{prefix}'")
+                exit(1)
+            if len(matches) == 0:
+                print(
+                    "ERROR: could not find a fixup target for {sha_summary.sha}")
+                exit(1)
+
+            # got it!
+            aliases[sha_summary.sha] = matches[0]
         return aliases
 
     def process(self):
@@ -187,7 +196,7 @@ class GitAutoFixup:
         summary_for = self._summary_for_commits(self._args.upstream)
         self._sha_aliases(summary_for)
         pprint(summary_for)
-        #pprint(hunks, width=200)
+        # pprint(hunks, width=200)
 
 
 if __name__ == '__main__':
