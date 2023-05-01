@@ -11,6 +11,7 @@ __version_info__ = ('0', '0', '1')
 __version__ = '.'.join(__version_info__)
 
 import argparse
+from collections import defaultdict
 import re
 import subprocess
 from dataclasses import dataclass
@@ -108,27 +109,28 @@ class GitAutoFixup:
                                 encoding='utf-8', stdout=subprocess.PIPE)
         return self._parse_hunks(proc.stdout)
 
-    def _summary_for_commits(self, rev):
+    def _summary_for_commits(self, rev: str) -> dict[str, str]:
         """
-        Returns an array [(sha, commit message summary), (sha, msg), ...] of all the commits
+        Returns an array [(sha, commit message summary), (sha, msg), ...] of all the commits that can be used
+        for fixup commits
         """
-        commits = []
+        commits = {}
         for line in subprocess.check_output(['git', 'log', '--no-merges', f'--format=%H:%s', f'{rev}..']).decode().split('\n'):
             line = line.strip()
             if not line:
                 continue
             sha, summary = line.split(':', maxsplit=1)
-            commits.append(ShaSummary(sha, summary))
+            commits[sha] = summary
         return commits
 
-    def _collect_sha_with_prefix(self, summary_for: List[ShaSummary], prefix: str) -> List[str]:
+    def _collect_sha_with_prefix(self, summary_for: dict[str, str], prefix: str) -> List[str]:
         sha_list = []
-        for sha_summary in summary_for:
-            if sha_summary.summary.startswith(prefix):
-                sha_list.append(sha_summary.sha)
+        for sha, summary in summary_for.items():
+            if summary.startswith(prefix):
+                sha_list.append(sha)
         return sha_list
 
-    def _sha_aliases(self, summary_for: List[ShaSummary]) -> dict[str, str]:
+    def _sha_aliases(self, summary_for: dict[str, str]) -> dict[str, str]:
         """
         Returns a dictionary of SHA-1 aliases for fixup!/squash! commits.
 
@@ -147,9 +149,17 @@ class GitAutoFixup:
         ```
         """
 
+        # count number of commits for each commit
+        summary_to_count = defaultdict(int)
+        for sha, summary in summary_for.items():
+            summary_to_count[summary] += 1
+        
+        pprint(summary_to_count)
+
+
         aliases = {}
-        for sha_summary in summary_for:
-            match = re.match(r"^(?:fixup|squash)! (.*)", sha_summary.summary)
+        for sha, summary in summary_for.items():
+            match = re.match(r"^(?:fixup|squash)! (.*)", summary)
             if not match:
                 continue
 
@@ -163,18 +173,22 @@ class GitAutoFixup:
             matches = self._collect_sha_with_prefix(summary_for, prefix)
             if len(matches) > 1:
                 print(
-                    "ERROR: ambigous fixup commit target: multiple commit summaries start with '{prefix}'")
+                    "ERROR: ambiguous fixup commit target: multiple commit summaries start with '{prefix}'")
                 exit(1)
             if len(matches) == 0:
                 print(
-                    "ERROR: could not find a fixup target for {sha_summary.sha}")
+                    "ERROR: could not find a fixup target for {sha}")
                 exit(1)
 
             # got it!
-            aliases[sha_summary.sha] = matches[0]
+            aliases[sha] = matches[0]
         return aliases
 
     def _blame(self, hunk: Hunk, alias_for: dict[str, str]) -> Hunk:
+        """
+        Blame for the hunk, collect the SHA hash of each line.
+        Uses alias_for to resolve the fixup SHAs.
+        """
         with subprocess.Popen(["git", "blame", "--porcelain", f"-L {hunk.start_line},+{hunk.num_lines}", "HEAD", "--", hunk.file],
                               cwd=self._toplevel, encoding='utf-8', stdout=subprocess.PIPE) as proc:
             sha = str
@@ -194,6 +208,13 @@ class GitAutoFixup:
                     # look up aliases, or use the original value if not found.
                     hunk.blame.append(alias_for.get(sha, sha))
         return hunk
+    
+    def _fixup_hunk_by_sha(self, hunk: Hunk, summary_for: List[ShaSummary]) :
+        targets = list(set(hunk.blame))
+
+        pprint(hunk.blame)
+        pprint(targets)
+        pprint("----")
 
     def process(self):
         print(self._args)
@@ -220,7 +241,10 @@ class GitAutoFixup:
         alias_for = self._sha_aliases(summary_for)
         for hunk in hunks:
             self._blame(hunk, alias_for)
+            self._fixup_hunk_by_sha(hunk, summary_for)
         pprint(hunks, width=200)
+        pprint(summary_for, width=200)
+
         # pprint(alias_for)
         # pprint(hunks, width=200)
 
