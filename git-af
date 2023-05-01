@@ -14,7 +14,7 @@ import argparse
 import re
 import subprocess
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple
 from pprint import pprint
 
 
@@ -25,6 +25,8 @@ class Hunk:
     num_lines: int
     header: str
     lines: List[str]
+    # For each line of the hunk, this is the sha of the commit (with resolved fixups)
+    blame: List[str]
 
 
 @dataclass
@@ -88,7 +90,7 @@ class GitAutoFixup:
                             break
                         lines.append(line)
                     hunk = Hunk(file_a, int(match.group(1)),
-                                int(match.group(2)), header, lines)
+                                int(match.group(2)), header, lines, [])
                     hunks.append(hunk)
         return hunks
 
@@ -126,7 +128,7 @@ class GitAutoFixup:
                 sha_list.append(sha_summary.sha)
         return sha_list
 
-    def _sha_aliases(self, summary_for):
+    def _sha_aliases(self, summary_for: List[ShaSummary]) -> dict[str, str]:
         """
         Returns a dictionary of SHA-1 aliases for fixup!/squash! commits.
 
@@ -172,6 +174,27 @@ class GitAutoFixup:
             aliases[sha_summary.sha] = matches[0]
         return aliases
 
+    def _blame(self, hunk: Hunk, alias_for: dict[str, str]) -> Hunk:
+        with subprocess.Popen(["git", "blame", "--porcelain", f"-L {hunk.start_line},+{hunk.num_lines}", "HEAD", "--", hunk.file],
+                              cwd=self._toplevel, encoding='utf-8', stdout=subprocess.PIPE) as proc:
+            sha = str
+            expected_line_number = hunk.start_line
+            current_line_number = str
+            for line in proc.stdout:
+                # Parse the SHA and line number from the current line if possible
+                match = re.match(r'^([0-9a-f]{40}) \d+ (\d+)', line)
+                if match:
+                    sha, current_line_number = match.groups()
+                elif line.startswith('\t'):
+                    if expected_line_number != int(current_line_number):
+                        print(
+                            f"ERROR: blame expected line number {expected_line_number} but got {current_line_number}!")
+                        exit(1)
+                    expected_line_number += 1
+                    # look up aliases, or use the original value if not found.
+                    hunk.blame.append(alias_for.get(sha, sha))
+        return hunk
+
     def process(self):
         print(self._args)
 
@@ -194,8 +217,11 @@ class GitAutoFixup:
 
         hunks = self._diff_hunks()
         summary_for = self._summary_for_commits(self._args.upstream)
-        self._sha_aliases(summary_for)
-        pprint(summary_for)
+        alias_for = self._sha_aliases(summary_for)
+        for hunk in hunks:
+            self._blame(hunk, alias_for)
+        pprint(hunks, width=200)
+        # pprint(alias_for)
         # pprint(hunks, width=200)
 
 
@@ -215,148 +241,43 @@ if __name__ == '__main__':
 
 
 '''
+def blame(hunk, alias_for):
+    # Check if the hunk count is 0, if so, return an empty dictionary
+    if hunk['count'] == 0:
+        return {}
 
-def parse_hunks(file_name):
-    """
-    Parse hunks out of `git diff` output.
-    Return a list of dictionaries representing the hunks, where each dictionary
-    contains the following fields:
+    # Call the 'git blame' command with the necessary arguments
+    cmd = ['git', 'blame', '--porcelain', f'-L {hunk["start"]},+{hunk["count"]}', 'HEAD', '--', hunk['file']]
 
-    - file: the name of the file being modified
-    - start: the starting line number of the hunk in the file being modified
-    - count: the number of lines modified in the hunk
-    - header: the header line of the hunk
-    - lines: a list of the lines modified in the hunk
+    # Initialize an empty dictionary to store the blame information
+    blame = {}
 
-    The function takes a file handle `fh` containing the output of a `git diff` command,
-    reads it line by line, and extracts the relevant information from each line.
-    The function uses regular expressions to match patterns in the input lines,
-    and builds up the output list of dictionaries as it processes the input.
-    The function returns the final list of dictionaries representing the hunks.
-    """
+    # Open a subprocess to execute the 'git blame' command and read its output
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+        # Loop through each line of the 'git blame' output
+        for line in proc.stdout:
+            # Convert the byte string to a UTF-8 string
+            line = line.decode('utf-8').rstrip()
 
-    file_a = None
-    file_b = None
-    hunks = []
-    with open(file_name, "r") as fh:
-        for line in fh:
-            if line.startswith('--- '):
-                file_a = line[4:].strip('\t\n')
-            elif line.startswith('+++ '):
-                file_b = line[4:].strip('\t\n')
-            elif re.match(r'^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@', line):
-                header = line
-                file_a = re.sub(r'^[abiwco]/', '', file_a) if file_a else None
-                file_b = re.sub(r'^[abiwco]/', '', file_b) if file_b else None
-                if file_a != file_b:
-                    continue  # Ignore creations and deletions.
-                lines = []
-                while True:
-                    line = fh.readline()
-                    if not line or not re.match(r'^[ +\\-]', line):
-                        break
-                    lines.append(line)
-                hunks.append({
-                    'file': file_a,
-                    'start': int(re.match(r'^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@', header).group(1)),
-                    'count': int(re.match(r'^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@', header).group(2) or 1),
-                    'header': header,
-                    'lines': lines,
-                })
-                # The next line after a hunk could be a header for the next commit
-                # or hunk.
-                if not line:
-                    line = fh.readline()
-                    continue
-        return hunks
+            # Parse the SHA and line number from the current line if possible
+            match = re.match(r'^([0-9a-f]{40}) \d+ (\d+)', line)
+            if match:
+                sha, line_num = match.groups()
 
+            # If the line starts with a tab character, add the blame information to the dictionary
+            if line.startswith('\t'):
+                if sha in alias_for:
+                    sha = alias_for[sha]
+                blame[int(line_num)] = {'sha': sha, 'text': line[1:]}
 
-def git_cmd(*args):
-    """
-    Returns a tuple that represents a Git command with options and arguments.
+    # Check if the 'git blame' command completed successfully
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=proc.stderr.read())
 
-    The function takes any number of arguments and returns a tuple containing the string
-    'git', followed by the contents of the GIT_OPTIONS list (if any), followed by the
-    arguments passed to the function.
+    # Return the dictionary of blame information
+    return blame
 
-    Example usage:
-    ```python
-    command = git_cmd('log', '--oneline', 'master..dev')
-    subprocess.run(command)
-    ```
-    """
-    return ('git', *GIT_OPTIONS, *args)
-
-
-def summary_for_commits(rev):
-    """
-    Returns a dictionary containing the commit message summaries for a given revision.
-
-    The function takes a string `rev` that specifies the revision to summarize, and uses
-    the `git log` command to retrieve the commit history for the specified revision,
-    excluding merge commits. It then splits the output into SHA-1 hashes and commit message
-    summaries, and returns a dictionary mapping each SHA-1 hash to its summary.
-
-    Example usage:
-    ```python
-    summaries = summary_for_commits('HEAD')
-    for sha, summary in summaries.items():
-        print(f'{sha}: {summary}')
-    ```
-    """
-    commits = {}
-    for line in subprocess.check_output(['git', 'log', '--no-merges', f'--format=%H:%s', f'{rev}..']).decode().split('\n'):
-        line = line.strip()
-        if not line:
-            continue
-        sha, summary = line.split(':', maxsplit=1)
-        commits[sha] = summary.strip()
-    return commits
-
-
-def sha_aliases(summary_for):
-    """
-    Returns a dictionary of SHA-1 aliases for fixup!/squash! commits.
-
-    The function takes a dictionary `summary_for` that maps each commit's SHA-1 hash to
-    its summary message. It then searches for commits with a summary message starting
-    with "fixup!" or "squash!", and generates an alias for each commit that points to
-    the SHA-1 hash of the commit being fixed up or squashed. The function returns a
-    dictionary that maps each fixup!/squash! commit SHA-1 hash to its alias.
-
-    Example usage:
-    ```python
-    summaries = summary_for_commits('HEAD')
-    aliases = sha_aliases(summaries)
-    for sha, alias in aliases.items():
-        print(f'{sha} -> {alias}')
-    ```
-    """
-    aliases = {}
-    targets = list(summary_for.keys())
-    for sha in targets:
-        summary = summary_for[sha]
-        if not summary.startswith(('fixup!', 'squash!')):
-            continue
-        prefix = summary.split(' ', maxsplit=1)[1]
-        if prefix.startswith(('fixup!', 'squash!')):
-            raise ValueError(
-                f"fixup commits for fixup commits aren't supported: {sha}")
-        matches = [
-            target for target in targets if summary_for[target].startswith(prefix)]
-        if len(matches) > 1:
-            raise ValueError(
-                f"ambiguous fixup commit target: multiple commit summaries start with: {prefix}")
-        elif not matches:
-            raise ValueError(f"no fixup target in topic branch: {sha}")
-        else:
-            aliases[sha] = matches[0]
-    return aliases
-
-
-VERBOSE = True
-
-
+    
 def fixup_sha(args):
     """
     Given a dictionary `args` containing the arguments `hunk`, `blame`,
