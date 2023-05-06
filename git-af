@@ -111,7 +111,7 @@ class GitAutoFixup:
 
     def _summary_for_commits(self, rev: str) -> dict[str, str]:
         """
-        Returns an array [(sha, commit message summary), (sha, msg), ...] of all the commits that can be used
+        Returns a dict sha => commit message summary of all the commits that can be used
         for fixup commits
         """
         commits = {}
@@ -123,18 +123,11 @@ class GitAutoFixup:
             commits[sha] = summary
         return commits
 
-    def _collect_sha_with_prefix(self, summary_for: dict[str, str], prefix: str) -> List[str]:
-        sha_list = []
-        for sha, summary in summary_for.items():
-            if summary.startswith(prefix):
-                sha_list.append(sha)
-        return sha_list
-
-    def _sha_aliases(self, summary_for: dict[str, str]) -> dict[str, str]:
+    def _sha_aliases(self, sha_to_summary: dict[str, str]) -> dict[str, str]:
         """
         Returns a dictionary of SHA-1 aliases for fixup!/squash! commits.
 
-        The function takes a dictionary `summary_for` that maps each commit's SHA-1 hash to
+        The function takes a dictionary `sha_to_summary` that maps each commit's SHA-1 hash to
         its summary message. It then searches for commits with a summary message starting
         with "fixup!" or "squash!", and generates an alias for each commit that points to
         the SHA-1 hash of the commit being fixed up or squashed. The function returns a
@@ -151,14 +144,16 @@ class GitAutoFixup:
 
         # count number of commits for each commit
         summary_to_count = defaultdict(int)
-        for sha, summary in summary_for.items():
+        summary_to_sha = {}
+        for sha, summary in sha_to_summary.items():
             summary_to_count[summary] += 1
+            summary_to_sha[sha] = summary
         
         pprint(summary_to_count)
 
 
         aliases = {}
-        for sha, summary in summary_for.items():
+        for sha, summary in sha_to_summary.items():
             match = re.match(r"^(?:fixup|squash)! (.*)", summary)
             if not match:
                 continue
@@ -170,18 +165,18 @@ class GitAutoFixup:
                 exit(1)
 
             # find commit target for fixup
-            matches = self._collect_sha_with_prefix(summary_for, prefix)
-            if len(matches) > 1:
+            num_matches = summary_to_count.get(prefix, 0)
+            if num_matches > 1:
                 print(
                     "ERROR: ambiguous fixup commit target: multiple commit summaries start with '{prefix}'")
                 exit(1)
-            if len(matches) == 0:
+            if num_matches == 0:
                 print(
                     "ERROR: could not find a fixup target for {sha}")
                 exit(1)
 
             # got it!
-            aliases[sha] = matches[0]
+            aliases[sha] = summary_to_sha[sha]
         return aliases
 
     def _blame(self, hunk: Hunk, alias_for: dict[str, str]) -> Hunk:
@@ -209,8 +204,10 @@ class GitAutoFixup:
                     hunk.blame.append(alias_for.get(sha, sha))
         return hunk
     
-    def _fixup_hunk_by_sha(self, hunk: Hunk, summary_for: List[ShaSummary]) :
-        targets = list(set(hunk.blame))
+    def _fixup_hunk_by_sha(self, hunk: Hunk, sha_to_summary: dict[str, str]) :
+        for sha in set(hunk.blame):
+            # TODO
+
 
         pprint(hunk.blame)
         pprint(targets)
@@ -237,13 +234,13 @@ class GitAutoFixup:
             ["git", "rev-parse", "--show-toplevel"], encoding='utf-8').strip()
 
         hunks = self._diff_hunks()
-        summary_for = self._summary_for_commits(self._args.upstream)
-        alias_for = self._sha_aliases(summary_for)
+        sha_to_summary = self._summary_for_commits(self._args.upstream)
+        alias_for = self._sha_aliases(sha_to_summary)
         for hunk in hunks:
             self._blame(hunk, alias_for)
-            self._fixup_hunk_by_sha(hunk, summary_for)
+            self._fixup_hunk_by_sha(hunk, sha_to_summary)
         pprint(hunks, width=200)
-        pprint(summary_for, width=200)
+        pprint(sha_to_summary, width=200)
 
         # pprint(alias_for)
         # pprint(hunks, width=200)
